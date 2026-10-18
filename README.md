@@ -281,6 +281,110 @@ A narrativa textual varia conforme o perfil:
 - Gera parecer técnico + sugestão + confiança
 - **Trava**: confiança < 0,60 ou valor ≥ R$ 100.000 → humano
 
+## Gerenciando Regras no DynamoDB (CreditRules)
+
+A tabela `CreditRules` é criada automaticamente pelo Spring Boot na inicialização (`CreditRulesDynamoRepository.createTableIfNotExists()`). As regras são persistidas em DynamoDB Local com **Partition Key = `ruleCategory`** e **Sort Key = `ruleId`**, e carregadas em memória pelo cache Caffeine (TTL de 5 minutos, recarregado na inicialização e via `@Scheduled`).
+
+### Estrutura do item
+
+| Atributo | Tipo | Chave | Descrição |
+|---|---|---|---|
+| `ruleCategory` | String | Partition Key | Categoria da regra: `HARD_CUTOFF` ou `AUTO_APPROVAL` |
+| `ruleId` | String | Sort Key | Identificador único da regra dentro da categoria |
+| `ruleName` | String | — | Nome amigável da regra |
+| `expression` | String | — | Expressão **SpEL** avaliada contra `#client` (record `ClientProfile`) |
+| `result` | String | — | `APPROVED` ou `REJECTED` |
+| `priority` | Number | — | Maior valor = avaliada primeiro |
+| `active` | Boolean | — | Se `false`, a regra é ignorada |
+| `description` | String | — | Texto explicativo |
+
+### Inserir uma regra (bash / AWS CLI)
+
+```bash
+aws dynamodb put-item \
+  --endpoint-url http://localhost:8000 \
+  --table-name CreditRules \
+  --item '{
+    "ruleCategory": {"S": "HARD_CUTOFF"},
+    "ruleId": {"S": "NOVA_REGRA"},
+    "ruleName": {"S": "Nome da Regra"},
+    "expression": {"S": "#client.score() < 300"},
+    "result": {"S": "REJECTED"},
+    "priority": {"N": "90"},
+    "active": {"BOOL": true},
+    "description": {"S": "Descrição da regra"}
+  }' \
+  --region us-east-1
+```
+
+### Exemplo completo: 3 regras
+
+```bash
+# 1) Rejeitar restritivo ativo
+aws dynamodb put-item \
+  --endpoint-url http://localhost:8000 \
+  --table-name CreditRules \
+  --item '{
+    "ruleCategory": {"S": "HARD_CUTOFF"},
+    "ruleId": {"S": "RESTRITIVO_ATIVO"},
+    "ruleName": {"S": "Restritivo cadastral"},
+    "expression": {"S": "#client.hasActiveRestrictive() == true"},
+    "result": {"S": "REJECTED"},
+    "priority": {"N": "100"},
+    "active": {"BOOL": true},
+    "description": {"S": "Cliente com restritivo ativo => rejeição automática"}
+  }' \
+  --region us-east-1
+
+# 2) Aprovar score excelente
+aws dynamodb put-item \
+  --endpoint-url http://localhost:8000 \
+  --table-name CreditRules \
+  --item '{
+    "ruleCategory": {"S": "AUTO_APPROVAL"},
+    "ruleId": {"S": "SCORE_EXCELENTE"},
+    "ruleName": {"S": "Score excelente"},
+    "expression": {"S": "#client.score() > 850"},
+    "result": {"S": "APPROVED"},
+    "priority": {"N": "80"},
+    "active": {"BOOL": true},
+    "description": {"S": "Score acima de 850 => aprovação automática"}
+  }' \
+  --region us-east-1
+
+# 3) Aprovar baixo risco (score >= 700 e renda >= 5000)
+aws dynamodb put-item \
+  --endpoint-url http://localhost:8000 \
+  --table-name CreditRules \
+  --item '{
+    "ruleCategory": {"S": "AUTO_APPROVAL"},
+    "ruleId": {"S": "BAIXO_RISCO"},
+    "ruleName": {"S": "Baixo risco"},
+    "expression": {"S": "#client.score() >= 700 && #client.income() >= 5000"},
+    "result": {"S": "APPROVED"},
+    "priority": {"N": "70"},
+    "active": {"BOOL": true},
+    "description": {"S": "Score e renda compatíveis => aprovação automática"}
+  }' \
+  --region us-east-1
+```
+
+### Listar todas as regras
+
+```bash
+aws dynamodb scan \
+  --endpoint-url http://localhost:8000 \
+  --table-name CreditRules \
+  --region us-east-1
+```
+
+### Como o motor avalia
+
+O motor (`CreditRuleEngine`) ordena as regras ativas por `priority` (decrescente) e executa cada expressão SpEL contra o perfil do cliente:
+- Se uma regra `REJECTED` bater → retorna `REJECTED` imediatamente (hard cutoff).
+- Se uma regra `APPROVED` bater → aprova, mas regras de maior prioridade ainda podem sobrescrever se forem rejeitivas.
+- Se nenhuma bater → `GRAY_ZONE` (prossegue para a Camada 2 – Laya).
+
 ## Parar Tudo
 
 ```bash
